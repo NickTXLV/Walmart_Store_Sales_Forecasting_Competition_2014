@@ -15,7 +15,7 @@
 # Understanding the data 
 # preparing the Data for Forecasting
 # Create the Forecast
-# Measure the Forecast Accuracy using MAPE
+# Measure the Forecast Accuracy using MAE
 
 
 
@@ -34,6 +34,10 @@ library(DataExplorer)
 
 library(plotly)
 
+
+library(doFuture)
+library(parallel)
+library(tictoc)
 
 # Get Data ----
 
@@ -367,9 +371,9 @@ data_prepared_full_tbl %>%
 
 
 #for the below Refer to 02_advanced_feature_engineering line 75
-#Add future windows extend the data timeseries into the forecast horizon 
-# Add the external regressiors to the future data frame
-#remove thte future data frame as an obect to use to preict on later
+#Add future windows extend the data time series into the forecast horizon 
+# Add the external regressors to the future data frame
+#remove the  future data frame as an object to use to predict on later
 
 
 # Seperate out future table from base data ----
@@ -641,13 +645,200 @@ calibration_tbl_xgboost %>%
 
 
 
+## Hyperparameter Tuning ----
+
+## Training/Testing Setup ----
+
+#Need to create Cross Validation plan to assess accuracy and stability of the models
+
+set.seed(123)
+samples_cv <- vfold_cv(
+  data= training(split),
+  v=10
+)
+
+samples_cv %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(.date_var = Date,
+                           .value= Total_Weekly_sales,
+                           .facet_ncol =2)
 
 
 
-## Hyperparamter Tuning ----
+## XGBOOST Hyper Tuning ----
+
+#Create the tune model
+
+model_hyper_xgboost <- boost_tree(
+  mode= "regression",
+  tree_depth = tune(),
+  trees = tune(),
+  learn_rate = tune(),
+  mtry= tune(),
+  min_n=tune(),
+  loss_reduction = tune()
+) %>%
+  set_engine("xgboost")
+
+## Hyperparameter Tuning Round 1 ----
+#Build the grid
+
+set.seed(123)
+grid_spec_model_hyper_xgboost<- grid_latin_hypercube(
+  extract_parameter_set_dials(model_hyper_xgboost) %>%
+    update(
+      mtry= mtry(range = c(1,10))
+    ),
+  size= 15
+
+)
+
+
+## Parallel Processing ----
+n_cores <- detectCores()
+
+parallel_start(n_cores)
+
+
+##  XGBOOST Tuned Workflow  ----
+
+tic()
+set.seed(123)
+
+
+
+tune_results_XGBOOST_kfold <- workflow_fit_base_xgboost %>%
+  update_model(model_hyper_xgboost) %>%
+  tune_grid(
+    resamples = samples_cv,
+    grid = grid_spec_model_hyper_xgboost,
+    metrics = default_forecast_accuracy_metric_set(),
+    control = control_grid(save_pred = TRUE)
+    
+  )
+
+
+toc()
+
+parallel_stop()
+
+
+# Accuracy Results of each iteration
+tune_results_XGBOOST_kfold %>%
+  show_best(metric = "mae",n=Inf)
+
+# Visualize the Results
+
+g<- tune_results_XGBOOST_kfold %>%
+  autoplot()+
+  geom_smooth(se= FALSE)
+
+ggplotly(g)
+
+
+
+## Hyperparameter Tuning Round 2 ----
+
+# To keep this simple, we will only adjust for the dominant parameter of learn rate
+
+set.seed(123)
+grid_spec_model_hyper_xgboost2 <- grid_latin_hypercube(
+  mtry= mtry(range = c(1,10)),
+  min_n(),
+  tree_depth(),
+  learn_rate(range = c(-1.82,-1)),
+  loss_reduction(),
+  trees(),
+  size=15
+)
+
+
+
+## Parallel Processing ----
+
+
+parallel_start(n_cores)
+
+
+##  XGBOOST Tuned Workflow  ----
+
+tic()
+set.seed(123)
+
+
+tune_results_XGBOOST_kfold <- workflow_fit_base_xgboost %>%
+  update_model(model_hyper_xgboost) %>%
+  tune_grid(
+    resamples = samples_cv,
+    grid = grid_spec_model_hyper_xgboost2,
+    metrics = default_forecast_accuracy_metric_set(),
+    control = control_grid(save_pred = TRUE)
+    
+  )
+
+toc()
+
+parallel_stop()
+
+
+
+# Accuracy Results of each iteration
+tune_results_XGBOOST_kfold %>%
+  show_best(metric = "mae",n=Inf)
+
+# Visualize the Results
+
+g<- tune_results_XGBOOST_kfold %>%
+  autoplot()+
+  geom_smooth(se= FALSE)
+
+ggplotly(g)
+
+
+
+
+
+
+# Train the Model and Assess the hypertuned inputs
+
+workflow_fit_hyper_XGBOOST <- workflow_fit_base_xgboost %>%
+  update_model(model_hyper_xgboost) %>%
+  finalize_workflow(
+    tune_results_XGBOOST_kfold %>%
+      show_best((metric = "mae"), n=1)
+  ) %>%
+  fit(training(split))
+
+
+
+## Final XGBOOST Models ----
+model_table_XGBOOST <- modeltime_table(
+  workflow_fit_base_xgboost,
+  workflow_fit_hyper_XGBOOST
+) %>%
+  update_model_description(1,"Base XGBOOST") %>%
+  update_model_description(2,"Hyper XGBOOST") 
+
+
+
+calibration_XGBOOST_tbl <- model_table_XGBOOST %>%
+  modeltime_calibrate(new_data = testing(split))
+
+
+calibration_XGBOOST_tbl %>%
+  modeltime_accuracy()
 
 
 ## Forecast XGBOOST Models----
+
+forecast_XGBOOST_tbl <- calibration_XGBOOST_tbl %>%
+  modeltime_forecast(
+    new_data = testing(split),
+    actual_data = processed_tbl
+  )
+
+forecast_XGBOOST_tbl %>%
+  plot_modeltime_forecast()
 
 
 
