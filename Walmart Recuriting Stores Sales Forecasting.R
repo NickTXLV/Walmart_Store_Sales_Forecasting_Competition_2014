@@ -26,6 +26,7 @@ library(tidymodels)
 library(tidyverse)
 
 library(modeltime)
+library(modeltime.ensemble)
 library(timetk)
 
 library(fastDummies)
@@ -845,22 +846,297 @@ forecast_XGBOOST_tbl %>%
 
 # ARIMA Boost ----
 
-recipe_spec_arima <-recipe(Total_Weekly_sales ~Date , data = training(split)) %>%
-  step_fourier(optin_time, period = c(7,14,30,90), K=1)
+## Build the Base Model ----
+model_base_ARIMA_boost <- arima_boost(
+  mtry = .8,
+  trees = 200,
+  min_n= 20,
+  tree_depth = 5,
+  learn_rate = .3,
+  loss_reduction = .2,
+) %>%
+  set_engine("auto_arima_xgboost",counts=FALSE)
 
-model_spec_arima<-arima_reg() %>%
-  set_engine("auto_arima")
 
+set.seed(123)
 
-workflow_fit_arima<-workflow() %>%
-  add_recipe(recipe_spec_arima) %>%
-  add_model(model_spec_arima) %>%
+workflow_fit_ARIMA_boost_base<- workflow() %>%
+  add_model(model_base_ARIMA_boost) %>%
+  add_recipe(recipe_date) %>%
   fit(training(split))
 
 
 
-modeltime_
 
+model_table_base_ARIMA_boost <- modeltime_table(workflow_fit_ARIMA_boost_base)
+
+
+calibration_tbl_ARIMA_boost <- model_table_base_ARIMA_boost %>%
+  modeltime_calibrate(new_data = testing(split))
+
+
+calibration_tbl_ARIMA_boost  %>%
+  modeltime_accuracy()
+
+
+## Hyperparameter Tuning ----
+
+# Setup Hyperparameter Tuning for a Sequential Model using Time Series Cross Validation
+
+#Create Time Series Samples
+
+samples_ts_cv <- time_series_cv(
+  data= training(split),
+  cumulative= TRUE,
+  assess= "12 weeks",
+  skip = "1 weeks",
+  slice_limit = 4
+)
+
+
+samples_ts_cv %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date,Total_Weekly_sales)
+
+
+# Prepare the model for Hyper Tuning
+
+model_hyper_ARIMA_boost <- arima_boost(
+  mtry = tune(),
+  trees = tune(),
+  min_n= tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+) %>%
+  set_engine("auto_arima_xgboost")
+  
+set.seed(123)
+
+
+parameters(model_hyper_ARIMA_boost) # Get List of parameters we can tune
+  
+
+#Build the grid
+
+set.seed(123)
+grid_spec_model_hyper_ARIMA_boost<- grid_latin_hypercube(
+  extract_parameter_set_dials(model_hyper_ARIMA_boost) %>%
+    update(
+      mtry= mtry(range = c(1,10))
+    ),
+  size= 15
+  
+)
+
+
+## Parallel Processing ----
+n_cores <- detectCores()
+
+parallel_start(n_cores)
+
+
+##  XGBOOST Tuned Workflow  ----
+
+## Hyperparameter Tuning Round 1 ----
+
+
+tic()
+set.seed(123)
+
+tune_results_hyper_ARIMA_boost<- workflow_fit_ARIMA_boost_base %>%
+  update_model(model_hyper_ARIMA_boost) %>%
+  tune_grid(
+    resamples = samples_ts_cv,
+    grid = grid_spec_model_hyper_ARIMA_boost,
+    metrics = default_forecast_accuracy_metric_set(),
+    control = control_grid(save_pred = TRUE)
+  )
+
+toc()
+
+parallel_stop()
+
+
+
+# Accuracy Results of each iteration
+tune_results_hyper_ARIMA_boost %>%
+  show_best(metric = "mae",n=Inf)
+
+# Visualize the Results
+
+g<- tune_results_hyper_ARIMA_boost %>%
+  autoplot()+
+  geom_smooth(se= FALSE)
+
+ggplotly(g)
+
+
+## Hyperparameter Tuning Round 2 ----
+
+# Use the plots to redefine the tuned parameters
+
+set.seed(123)
+grid_spec_model_hyper_ARIMA_boost2 <- grid_latin_hypercube(
+  mtry =  mtry(range = c(1,10)),
+  trees(),
+  min_n(),
+  tree_depth(),
+  learn_rate(range = c(-3,-1.)),
+  loss_reduction(),
+  size= 15
+)
+
+# Parallel Processing
+
+n_cores <- detectCores()
+
+parallel_start(n_cores)
+
+tic()
+set.seed(123)
+
+tune_results_hyper_ARIMA_boost2 <- workflow_fit_ARIMA_boost_base %>%
+  update_model(model_hyper_ARIMA_boost) %>%
+  tune_grid(
+    resamples = samples_ts_cv,
+    grid = grid_spec_model_hyper_ARIMA_boost2,
+    metrics = default_forecast_accuracy_metric_set(),
+    control = control_grid(save_pred = TRUE)
+  )
+
+toc()
+
+parallel_stop()
+
+
+
+# Accuracy Results of each iteration
+tune_results_hyper_ARIMA_boost2 %>%
+  show_best(metric = "mae",n=Inf)
+
+# Visualize the Results
+
+g<- tune_results_hyper_ARIMA_boost2 %>%
+  autoplot()+
+  geom_smooth(se= FALSE)
+
+ggplotly(g)
+
+
+
+
+# Train the Model and Assess the hypertuned inputs
+
+workflow_fit_hyper_ARIMA_boost <- workflow_fit_ARIMA_boost_base %>%
+  update_model(model_hyper_ARIMA_boost) %>%
+  finalize_workflow(
+    tune_results_hyper_ARIMA_boost2 %>%
+      show_best((metric = "mae"), n=1)
+  ) %>%
+  fit(training(split))
+
+
+
+## Final ARIMA Boost Models ----
+model_table_ARIMA_boost <- modeltime_table(
+  workflow_fit_ARIMA_boost_base,
+  workflow_fit_hyper_ARIMA_boost
+) %>%
+  update_model_description(1,"Base ARIMA_boost") %>%
+  update_model_description(2,"Hyper ARIMA_boost") 
+
+
+
+calibration_ARIMA_boost_tbl <- model_table_ARIMA_boost %>%
+  modeltime_calibrate(new_data = testing(split))
+
+
+calibration_ARIMA_boost_tbl %>%
+  modeltime_accuracy()
+
+
+## Forecast ARIMA Boost Models----
+
+forecast_ARIMA_boost_tbl <- calibration_ARIMA_boost_tbl %>%
+  modeltime_forecast(
+    new_data = testing(split),
+    actual_data = processed_tbl
+  )
+
+forecast_ARIMA_boost_tbl %>%
+  plot_modeltime_forecast()
+
+
+
+# **Overall Model Evaluation** ----
+
+#We will build an ensemble model comprised of all the other models
+#we have already built
+
+
+# Combine the models into 1 table
+
+
+combined_models_table<-combine_modeltime_tables(model_table_glmnet,
+                         model_table_XGBOOST,
+                         model_table_ARIMA_boost)
+
+combined_models_calibration<-combined_models_table %>%
+  modeltime_refit(training(split)) %>%
+  modeltime_calibrate(testing(split))
+
+#View the Results in a nice formatted table
+
+combined_models_calibration %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(
+    bordered = TRUE,
+    resizable = TRUE,
+    .filterable = TRUE)
+
+#Lets forecast them all together to see how they perform
+
+
+forecast_combined_models <- combined_models_calibration %>%
+  modeltime_forecast(
+    new_data = testing(split),
+    actual_data = processed_tbl
+  )
+
+forecast_combined_models %>%
+  plot_modeltime_forecast(.conf_interval_show = FALSE)
+
+
+# Ensemble Models ----
+
+# We will use a stacked ensemble approach
+
+#Create Time Series CV- We have to use this since we have an ARIMA model
+
+samples_ts_cv <- time_series_cv(
+  data= training(split),
+  cumulative= TRUE,
+  assess= "12 weeks",
+  skip = "1 weeks",
+  slice_limit = 4
+)
+
+
+samples_ts_cv %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(Date,Total_Weekly_sales)
+
+
+
+
+combined_models_ts_cv <- combined_models_table %>%
+  ensemble_model_spec(
+    kfolds = 4,
+    grid = 4,
+    control = control_grid(verbose = TRUE)
+  )
+  
 
 
 
